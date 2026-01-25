@@ -1,0 +1,313 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate action.yml
+        run: |
+          echo "Validating action.yml..."
+          python3 -c "import yaml; yaml.safe_load(open('action.yml'))"
+
+  test-setup:
+    name: Test Setup
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test migration
+        shell: bash
+        run: |
+          mkdir -p test-migrations
+          cat > test-migrations/001_test.json << 'EOF'
+          {
+            "name": "001_test",
+            "operations": [
+              {
+                "create_table": {
+                  "name": "test_table",
+                  "columns": [
+                    {"name": "id", "type": "serial", "pk": true}
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Test action (validates setup + command)
+        uses: ./
+        id: test
+        with:
+          command: validate
+          migration-file: test-migrations/001_test.json
+
+      - name: Verify outputs
+        shell: bash
+        run: |
+          echo "pgroll version: ${{ steps.test.outputs.pgroll-version }}"
+          echo "pgroll path: ${{ steps.test.outputs.pgroll-path }}"
+          echo "Valid: ${{ steps.test.outputs.valid }}"
+          pgroll --version
+
+      - name: Test cache hit
+        uses: ./
+        with:
+          command: validate
+          migration-file: test-migrations/001_test.json
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test migration
+        run: |
+          mkdir -p test-migrations
+          cat > test-migrations/001_create_users.json << 'EOF'
+          {
+            "name": "001_create_users",
+            "operations": [
+              {
+                "create_table": {
+                  "name": "users",
+                  "columns": [
+                    {
+                      "name": "id",
+                      "type": "serial",
+                      "pk": true
+                    },
+                    {
+                      "name": "name",
+                      "type": "text",
+                      "nullable": false
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Test init
+        uses: ./
+        with:
+          command: init
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+
+      - name: Test status
+        uses: ./
+        id: status-before
+        with:
+          command: status
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+
+      - name: Verify status output
+        run: |
+          echo "Status: ${{ steps.status-before.outputs.status }}"
+          echo "JSON: ${{ steps.status-before.outputs.json }}"
+
+      - name: Test start
+        uses: ./
+        id: start
+        with:
+          command: start
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+          migration-file: test-migrations/001_create_users.json
+
+      - name: Verify start output
+        run: |
+          echo "Version: ${{ steps.start.outputs.version }}"
+
+      - name: Test complete
+        uses: ./
+        with:
+          command: complete
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+
+      - name: Test status after migration
+        uses: ./
+        id: status-after
+        with:
+          command: status
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+
+      - name: Verify final status
+        run: |
+          echo "Status: ${{ steps.status-after.outputs.status }}"
+          echo "Version: ${{ steps.status-after.outputs.version }}"
+
+  test-rollback:
+    name: Test Rollback
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rollbackdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test migration
+        run: |
+          mkdir -p migrations
+          cat > migrations/001_create_posts.json << 'EOF'
+          {
+            "name": "001_create_posts",
+            "operations": [
+              {
+                "create_table": {
+                  "name": "posts",
+                  "columns": [
+                    {"name": "id", "type": "serial", "pk": true},
+                    {"name": "title", "type": "text", "nullable": false}
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Init
+        uses: ./
+        with:
+          command: init
+          postgres-url: postgres://postgres:postgres@localhost:5432/rollbackdb
+
+      - name: Start migration
+        uses: ./
+        with:
+          command: start
+          postgres-url: postgres://postgres:postgres@localhost:5432/rollbackdb
+          migration-file: migrations/001_create_posts.json
+
+      - name: Rollback migration
+        uses: ./
+        with:
+          command: rollback
+          postgres-url: postgres://postgres:postgres@localhost:5432/rollbackdb
+
+      - name: Verify rollback
+        uses: ./
+        id: status
+        with:
+          command: status
+          postgres-url: postgres://postgres:postgres@localhost:5432/rollbackdb
+
+      - name: Check status
+        run: |
+          echo "Status after rollback: ${{ steps.status.outputs.status }}"
+
+  test-migrate:
+    name: Test Migrate Command
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: migratedb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create multiple migrations
+        run: |
+          mkdir -p migrations
+          
+          cat > migrations/001_create_users.json << 'EOF'
+          {
+            "name": "001_create_users",
+            "operations": [
+              {
+                "create_table": {
+                  "name": "users",
+                  "columns": [
+                    {"name": "id", "type": "serial", "pk": true},
+                    {"name": "name", "type": "text", "nullable": false}
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+          
+          cat > migrations/002_create_posts.json << 'EOF'
+          {
+            "name": "002_create_posts",
+            "operations": [
+              {
+                "create_table": {
+                  "name": "posts",
+                  "columns": [
+                    {"name": "id", "type": "serial", "pk": true},
+                    {"name": "title", "type": "text", "nullable": false},
+                    {"name": "user_id", "type": "integer", "nullable": false}
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Init
+        uses: ./
+        with:
+          command: init
+          postgres-url: postgres://postgres:postgres@localhost:5432/migratedb
+
+      - name: Migrate all
+        uses: ./
+        id: migrate
+        with:
+          command: migrate
+          postgres-url: postgres://postgres:postgres@localhost:5432/migratedb
+          migrations-dir: ./migrations
+
+      - name: Check results
+        run: |
+          echo "Applied count: ${{ steps.migrate.outputs.applied-count }}"
+          echo "Final version: ${{ steps.migrate.outputs.version }}"

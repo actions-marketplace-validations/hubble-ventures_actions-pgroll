@@ -1,0 +1,79 @@
+# Example: Production Deployment with Staged Rollout
+# Uses pgroll's dual-schema feature for zero-downtime migrations
+
+name: Production Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration-file:
+        description: 'Migration file to apply (e.g., migrations/003_add_column.json)'
+        required: true
+        type: string
+      auto-complete:
+        description: 'Automatically complete the migration'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start migration (creates dual schema)
+      - uses: hubble-ventures/actions-pgroll@v1
+        id: start
+        with:
+          command: start
+          postgres-url: ${{ secrets.PROD_DATABASE_URL }}
+          migration-file: ${{ inputs.migration-file }}
+
+      - name: Migration started
+        run: |
+          echo "🚀 Migration started!"
+          echo "New schema version: ${{ steps.start.outputs.version }}"
+          echo ""
+          echo "Both old and new schema versions are now available."
+          echo "Deploy your application to use the new schema version."
+
+      # Get current status
+      - uses: hubble-ventures/actions-pgroll@v1
+        id: status
+        with:
+          command: status
+          postgres-url: ${{ secrets.PROD_DATABASE_URL }}
+
+      - name: Current status
+        run: |
+          echo "Current status: ${{ steps.status.outputs.status }}"
+          echo "Current version: ${{ steps.status.outputs.version }}"
+
+      # Complete migration if auto-complete is enabled
+      - name: Complete migration
+        if: inputs.auto-complete
+        uses: hubble-ventures/actions-pgroll@v1
+        with:
+          command: complete
+          postgres-url: ${{ secrets.PROD_DATABASE_URL }}
+
+      - name: Migration completed
+        if: inputs.auto-complete
+        run: |
+          echo "✅ Migration completed!"
+          echo "Old schema version has been removed."
+
+      - name: Manual completion required
+        if: "!inputs.auto-complete"
+        run: |
+          echo "⏳ Migration is in progress but not completed."
+          echo ""
+          echo "To complete the migration, run:"
+          echo "  pgroll complete --postgres-url \$DATABASE_URL"
+          echo ""
+          echo "Or trigger another workflow run with auto-complete enabled."
+          echo ""
+          echo "To rollback, run:"
+          echo "  pgroll rollback --postgres-url \$DATABASE_URL"

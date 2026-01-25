@@ -1,0 +1,24 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# Test artifacts
+*.log
+tmp/
+.tmp/
+
+# Local testing
+.env
+.env.local
+.secrets
+
+# Act (local GitHub Actions testing)
+.actrc

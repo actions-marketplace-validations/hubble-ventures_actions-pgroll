@@ -1,0 +1,383 @@
+name: 'pgroll Action'
+description: 'GitHub Action wrapper for the pgroll CLI - PostgreSQL zero-downtime migrations by Xata'
+author: 'Hubble Ventures'
+
+branding:
+  icon: 'database'
+  color: 'blue'
+
+inputs:
+  command:
+    description: 'pgroll command: init, start, complete, rollback, status, validate, migrate, baseline'
+    required: true
+  version:
+    description: 'pgroll version to install (e.g., "0.16.0" or "latest")'
+    required: false
+    default: 'latest'
+  verify-checksum:
+    description: 'Verify binary checksum (recommended for security)'
+    required: false
+    default: 'true'
+  postgres-url:
+    description: 'PostgreSQL connection URL'
+    required: false
+  migration-file:
+    description: 'Path to migration file (for start, validate)'
+    required: false
+  migrations-dir:
+    description: 'Path to migrations directory (for migrate, baseline)'
+    required: false
+  migration-name:
+    description: 'Migration name (for baseline)'
+    required: false
+  schema:
+    description: 'Target schema'
+    required: false
+    default: 'public'
+  pgroll-schema:
+    description: 'Schema name for pgroll internal state'
+    required: false
+    default: 'pgroll'
+  lock-timeout:
+    description: 'Lock timeout in milliseconds'
+    required: false
+    default: '500'
+  role:
+    description: 'PostgreSQL role for DDL operations'
+    required: false
+  complete:
+    description: 'Complete migration after start (for start command)'
+    required: false
+    default: 'false'
+  backfill-batch-size:
+    description: 'Number of rows per backfill batch'
+    required: false
+    default: '1000'
+  backfill-batch-delay:
+    description: 'Delay between backfill batches (e.g., "100ms", "1s")'
+    required: false
+    default: '0s'
+
+outputs:
+  version:
+    description: 'Schema version (context-dependent)'
+    value: ${{ steps.run.outputs.version }}
+  status:
+    description: 'Migration status (for status command)'
+    value: ${{ steps.run.outputs.status }}
+  json:
+    description: 'Full JSON output (for status command)'
+    value: ${{ steps.run.outputs.json }}
+  valid:
+    description: 'Validation result (for validate command)'
+    value: ${{ steps.run.outputs.valid }}
+  errors:
+    description: 'Validation errors (for validate command)'
+    value: ${{ steps.run.outputs.errors }}
+  applied-count:
+    description: 'Number of migrations applied (for migrate command)'
+    value: ${{ steps.run.outputs.applied-count }}
+  file:
+    description: 'Generated file path (for baseline command)'
+    value: ${{ steps.run.outputs.file }}
+  pgroll-version:
+    description: 'Installed pgroll version'
+    value: ${{ steps.install.outputs.version }}
+  pgroll-path:
+    description: 'Path to pgroll binary'
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ========== Setup pgroll ==========
+    - name: Determine platform
+      id: platform
+      shell: bash
+      run: |
+        OS="${{ runner.os }}"
+        ARCH="${{ runner.arch }}"
+        
+        # Map runner OS to pgroll naming
+        case "$OS" in
+          Linux)   PLATFORM_OS="linux" ;;
+          macOS)   PLATFORM_OS="macos" ;;
+          Windows) PLATFORM_OS="win" ;;
+          *) echo "::error::Unsupported OS: $OS"; exit 1 ;;
+        esac
+        
+        # Map runner arch to pgroll naming
+        case "$ARCH" in
+          X64)   PLATFORM_ARCH="amd64" ;;
+          ARM64) PLATFORM_ARCH="arm64" ;;
+          *) echo "::error::Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+        
+        # Windows only supports amd64
+        if [ "$PLATFORM_OS" = "win" ] && [ "$PLATFORM_ARCH" = "arm64" ]; then
+          echo "::error::Windows ARM64 is not supported by pgroll"
+          exit 1
+        fi
+        
+        echo "os=$PLATFORM_OS" >> $GITHUB_OUTPUT
+        echo "arch=$PLATFORM_ARCH" >> $GITHUB_OUTPUT
+
+    - name: Get pgroll version
+      id: get-version
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -s https://api.github.com/repos/xataio/pgroll/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Failed to fetch latest pgroll version"
+            exit 1
+          fi
+        fi
+        # Remove 'v' prefix if present
+        VERSION="${VERSION#v}"
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Cache pgroll
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/pgroll/${{ steps.get-version.outputs.version }}
+        key: pgroll-${{ steps.get-version.outputs.version }}-${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}
+
+    - name: Download pgroll
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        VERSION="${{ steps.get-version.outputs.version }}"
+        OS="${{ steps.platform.outputs.os }}"
+        ARCH="${{ steps.platform.outputs.arch }}"
+        
+        # Determine binary name based on platform
+        if [ "$OS" = "win" ]; then
+          BINARY_NAME="pgroll.${OS}.${ARCH}.exe"
+          LOCAL_BINARY="pgroll.exe"
+        else
+          BINARY_NAME="pgroll.${OS}.${ARCH}"
+          LOCAL_BINARY="pgroll"
+        fi
+        
+        DOWNLOAD_URL="https://github.com/xataio/pgroll/releases/download/v${VERSION}/${BINARY_NAME}"
+        CHECKSUMS_URL="https://github.com/xataio/pgroll/releases/download/v${VERSION}/pgroll_${VERSION}_checksums.txt"
+        
+        echo "Downloading pgroll v${VERSION} from ${DOWNLOAD_URL}"
+        
+        INSTALL_DIR="${{ runner.tool_cache }}/pgroll/${VERSION}"
+        mkdir -p "$INSTALL_DIR"
+        
+        # Download binary
+        curl -sL "$DOWNLOAD_URL" -o "$INSTALL_DIR/$LOCAL_BINARY"
+        
+        # Verify checksum if enabled
+        if [ "${{ inputs.verify-checksum }}" = "true" ]; then
+          echo "Verifying checksum..."
+          
+          # Download checksums file
+          CHECKSUMS=$(curl -sL "$CHECKSUMS_URL")
+          
+          # Extract expected checksum for our binary
+          EXPECTED_CHECKSUM=$(echo "$CHECKSUMS" | grep "$BINARY_NAME" | awk '{print $1}')
+          
+          if [ -z "$EXPECTED_CHECKSUM" ]; then
+            echo "::warning::Checksum not found for $BINARY_NAME, skipping verification"
+          else
+            # Calculate actual checksum
+            if command -v sha256sum &> /dev/null; then
+              ACTUAL_CHECKSUM=$(sha256sum "$INSTALL_DIR/$LOCAL_BINARY" | awk '{print $1}')
+            else
+              # macOS uses shasum
+              ACTUAL_CHECKSUM=$(shasum -a 256 "$INSTALL_DIR/$LOCAL_BINARY" | awk '{print $1}')
+            fi
+            
+            if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
+              echo "::error::Checksum verification failed!"
+              echo "Expected: $EXPECTED_CHECKSUM"
+              echo "Actual:   $ACTUAL_CHECKSUM"
+              rm -f "$INSTALL_DIR/$LOCAL_BINARY"
+              exit 1
+            fi
+            
+            echo "Checksum verified successfully"
+          fi
+        fi
+        
+        # Make binary executable (no-op on Windows but doesn't hurt)
+        chmod +x "$INSTALL_DIR/$LOCAL_BINARY"
+        
+        echo "pgroll v${VERSION} installed to $INSTALL_DIR"
+
+    - name: Add pgroll to PATH
+      id: install
+      shell: bash
+      run: |
+        VERSION="${{ steps.get-version.outputs.version }}"
+        INSTALL_DIR="${{ runner.tool_cache }}/pgroll/${VERSION}"
+        OS="${{ steps.platform.outputs.os }}"
+        
+        echo "$INSTALL_DIR" >> $GITHUB_PATH
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        
+        if [ "$OS" = "win" ]; then
+          echo "path=$INSTALL_DIR/pgroll.exe" >> $GITHUB_OUTPUT
+          "$INSTALL_DIR/pgroll.exe" --version
+        else
+          echo "path=$INSTALL_DIR/pgroll" >> $GITHUB_OUTPUT
+          "$INSTALL_DIR/pgroll" --version
+        fi
+
+    # ========== Run pgroll command ==========
+    - name: Run pgroll command
+      id: run
+      shell: bash
+      env:
+        PGROLL_PG_URL: ${{ inputs.postgres-url }}
+      run: |
+        set -e
+        
+        COMMAND="${{ inputs.command }}"
+        
+        case "$COMMAND" in
+          init)
+            pgroll init \
+              --postgres-url "$PGROLL_PG_URL" \
+              --pgroll-schema "${{ inputs.pgroll-schema }}"
+            ;;
+          
+          start)
+            ARGS=""
+            ARGS="$ARGS --postgres-url $PGROLL_PG_URL"
+            ARGS="$ARGS --schema ${{ inputs.schema }}"
+            ARGS="$ARGS --pgroll-schema ${{ inputs.pgroll-schema }}"
+            ARGS="$ARGS --lock-timeout ${{ inputs.lock-timeout }}"
+            ARGS="$ARGS --backfill-batch-size ${{ inputs.backfill-batch-size }}"
+            ARGS="$ARGS --backfill-batch-delay ${{ inputs.backfill-batch-delay }}"
+            
+            if [ -n "${{ inputs.role }}" ]; then
+              ARGS="$ARGS --role ${{ inputs.role }}"
+            fi
+            
+            if [ "${{ inputs.complete }}" = "true" ]; then
+              ARGS="$ARGS --complete"
+            fi
+            
+            pgroll start $ARGS "${{ inputs.migration-file }}"
+            
+            VERSION=$(basename "${{ inputs.migration-file }}" .json)
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            ;;
+          
+          complete)
+            pgroll complete \
+              --postgres-url "$PGROLL_PG_URL" \
+              --schema "${{ inputs.schema }}" \
+              --pgroll-schema "${{ inputs.pgroll-schema }}"
+            ;;
+          
+          rollback)
+            pgroll rollback \
+              --postgres-url "$PGROLL_PG_URL" \
+              --schema "${{ inputs.schema }}" \
+              --pgroll-schema "${{ inputs.pgroll-schema }}"
+            ;;
+          
+          status)
+            OUTPUT=$(pgroll status \
+              --postgres-url "$PGROLL_PG_URL" \
+              --schema "${{ inputs.schema }}" \
+              --pgroll-schema "${{ inputs.pgroll-schema }}" \
+              --format json)
+            
+            echo "$OUTPUT"
+            
+            SCHEMA=$(echo "$OUTPUT" | jq -r '.schema // empty')
+            VERSION=$(echo "$OUTPUT" | jq -r '.version // empty')
+            STATUS=$(echo "$OUTPUT" | jq -r '.status // empty')
+            
+            echo "schema=$SCHEMA" >> $GITHUB_OUTPUT
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "status=$STATUS" >> $GITHUB_OUTPUT
+            
+            JSON_ESCAPED=$(echo "$OUTPUT" | jq -c .)
+            echo "json=$JSON_ESCAPED" >> $GITHUB_OUTPUT
+            ;;
+          
+          validate)
+            ARGS=""
+            
+            if [ -n "$PGROLL_PG_URL" ]; then
+              ARGS="$ARGS --postgres-url $PGROLL_PG_URL"
+              ARGS="$ARGS --schema ${{ inputs.schema }}"
+            fi
+            
+            if OUTPUT=$(pgroll validate $ARGS "${{ inputs.migration-file }}" 2>&1); then
+              echo "valid=true" >> $GITHUB_OUTPUT
+              echo "errors=" >> $GITHUB_OUTPUT
+              echo "Migration file is valid"
+            else
+              echo "valid=false" >> $GITHUB_OUTPUT
+              echo "errors=$OUTPUT" >> $GITHUB_OUTPUT
+              echo "Migration file validation failed:"
+              echo "$OUTPUT"
+              exit 1
+            fi
+            ;;
+          
+          migrate)
+            ARGS=""
+            ARGS="$ARGS --postgres-url $PGROLL_PG_URL"
+            ARGS="$ARGS --schema ${{ inputs.schema }}"
+            ARGS="$ARGS --pgroll-schema ${{ inputs.pgroll-schema }}"
+            ARGS="$ARGS --lock-timeout ${{ inputs.lock-timeout }}"
+            ARGS="$ARGS --backfill-batch-size ${{ inputs.backfill-batch-size }}"
+            ARGS="$ARGS --backfill-batch-delay ${{ inputs.backfill-batch-delay }}"
+            
+            if [ -n "${{ inputs.role }}" ]; then
+              ARGS="$ARGS --role ${{ inputs.role }}"
+            fi
+            
+            OUTPUT=$(pgroll migrate $ARGS "${{ inputs.migrations-dir }}" 2>&1)
+            echo "$OUTPUT"
+            
+            APPLIED=$(echo "$OUTPUT" | grep -c "applied" || echo "0")
+            echo "applied-count=$APPLIED" >> $GITHUB_OUTPUT
+            
+            STATUS_OUTPUT=$(pgroll status \
+              --postgres-url "$PGROLL_PG_URL" \
+              --schema "${{ inputs.schema }}" \
+              --pgroll-schema "${{ inputs.pgroll-schema }}" \
+              --format json 2>&1 || echo "{}")
+            
+            VERSION=$(echo "$STATUS_OUTPUT" | jq -r '.version // empty')
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            ;;
+          
+          baseline)
+            OUTPUT_DIR="${{ inputs.migrations-dir }}"
+            if [ -z "$OUTPUT_DIR" ]; then
+              OUTPUT_DIR="."
+            fi
+            mkdir -p "$OUTPUT_DIR"
+            
+            pgroll baseline \
+              --postgres-url "$PGROLL_PG_URL" \
+              --schema "${{ inputs.schema }}" \
+              --pgroll-schema "${{ inputs.pgroll-schema }}" \
+              --output-dir "$OUTPUT_DIR" \
+              "${{ inputs.migration-name }}"
+            
+            FILE="$OUTPUT_DIR/${{ inputs.migration-name }}.json"
+            echo "file=$FILE" >> $GITHUB_OUTPUT
+            echo "Baseline migration created: $FILE"
+            ;;
+          
+          *)
+            echo "::error::Unknown command: $COMMAND"
+            echo "Valid commands: init, start, complete, rollback, status, validate, migrate, baseline"
+            exit 1
+            ;;
+        esac

@@ -1,0 +1,55 @@
+name: Check pgroll Release
+
+on:
+  schedule:
+    # Run every Monday at 9am UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Check for new pgroll version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest pgroll version
+        id: latest
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/xataio/pgroll/releases/latest | jq -r '.tag_name')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest pgroll version: $VERSION"
+
+      - name: Create test migration
+        run: |
+          mkdir -p test-migrations
+          cat > test-migrations/test.json << 'EOF'
+          {
+            "name": "test_migration",
+            "operations": [
+              {
+                "create_table": {
+                  "name": "test_table",
+                  "columns": [
+                    {"name": "id", "type": "serial", "pk": true}
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Test latest version works
+        uses: ./
+        id: test
+        with:
+          command: validate
+          version: latest
+          migration-file: test-migrations/test.json
+
+      - name: Verify
+        run: |
+          INSTALLED=$(pgroll --version | head -1)
+          echo "Installed: $INSTALLED"
+          echo "Expected: ${{ steps.latest.outputs.version }}"
+          echo "pgroll version from action: ${{ steps.test.outputs.pgroll-version }}"

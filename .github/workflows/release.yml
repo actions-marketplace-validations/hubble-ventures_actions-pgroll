@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Update Major Version Tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          
+          # Validate semver format (v1.2.3 or v1.2.3-beta.1)
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
+            exit 1
+          fi
+          
+          # Extract major version (v1.2.3 -> v1)
+          MAJOR=$(echo "$TAG" | sed -E 's/^(v[0-9]+)\..*/\1/')
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "major=$MAJOR" >> $GITHUB_OUTPUT
+          echo "Release tag: $TAG"
+          echo "Major version tag: $MAJOR"
+
+      - name: Update major version tag
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          MAJOR="${{ steps.tag.outputs.major }}"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Get the commit SHA for the release tag
+          SHA=$(git rev-list -n 1 "$TAG")
+          
+          # Delete the major version tag if it exists (both local and remote)
+          git tag -d "$MAJOR" 2>/dev/null || true
+          git push origin ":refs/tags/$MAJOR" 2>/dev/null || true
+          
+          # Create the major version tag pointing to the same commit
+          git tag "$MAJOR" "$SHA"
+          git push origin "$MAJOR"
+          
+          echo "Updated $MAJOR tag to point to $TAG ($SHA)"
+
+      - name: Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release tag**: \`${{ steps.tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Major version tag**: \`${{ steps.tag.outputs.major }}\` (updated)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Users can now reference this action as:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`hubble-ventures/actions-pgroll@${{ steps.tag.outputs.tag }}\` - pinned to exact version" >> $GITHUB_STEP_SUMMARY
+          echo "- \`hubble-ventures/actions-pgroll@${{ steps.tag.outputs.major }}\` - follows latest in major version" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,22 @@
+# Example: Basic Migration Workflow
+# Apply all migrations when pushing to main
+
+name: Apply Migrations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hubble-ventures/actions-pgroll@v1
+        with:
+          command: migrate
+          postgres-url: ${{ secrets.DATABASE_URL }}
+          migrations-dir: ./migrations

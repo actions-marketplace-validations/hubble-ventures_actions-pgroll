@@ -1,0 +1,64 @@
+# Example: CI Validation Workflow
+# Validate migration files in pull requests
+
+name: Validate Migrations
+
+on:
+  pull_request:
+    paths:
+      - 'migrations/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install pgroll by validating the first migration file
+      # This makes pgroll available in PATH for subsequent steps
+      - name: Install pgroll and validate first migration
+        uses: hubble-ventures/actions-pgroll@v1
+        with:
+          command: validate
+          migration-file: migrations/001_initial.json  # Adjust to your first migration
+
+      # Validate remaining migration files using the CLI directly
+      - name: Validate all migration files
+        run: |
+          set -e
+          for file in migrations/*.json; do
+            echo "::group::Validating $file"
+            pgroll validate "$file"
+            echo "::endgroup::"
+          done
+
+  # Optional: Test against a real database
+  test-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hubble-ventures/actions-pgroll@v1
+        with:
+          command: init
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+
+      - uses: hubble-ventures/actions-pgroll@v1
+        with:
+          command: migrate
+          postgres-url: postgres://postgres:postgres@localhost:5432/testdb
+          migrations-dir: ./migrations

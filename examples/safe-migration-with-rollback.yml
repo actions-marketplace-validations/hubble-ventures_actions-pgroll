@@ -1,0 +1,87 @@
+# Example: Safe Migration with Automatic Rollback
+# Runs tests after starting migration, rolls back on failure
+
+name: Safe Migration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'migrations/**'
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: appdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hubble-ventures/actions-pgroll/setup@v1
+
+      # Initialize (safe to run multiple times)
+      - uses: hubble-ventures/actions-pgroll/init@v1
+        with:
+          postgres-url: postgres://postgres:postgres@localhost:5432/appdb
+        continue-on-error: true
+
+      # Start the migration
+      - uses: hubble-ventures/actions-pgroll/start@v1
+        id: start
+        with:
+          postgres-url: postgres://postgres:postgres@localhost:5432/appdb
+          migration-file: ./migrations/latest.json
+
+      - name: Migration started
+        run: echo "Started migration version ${{ steps.start.outputs.version }}"
+
+      # Run your application tests
+      - name: Run application tests
+        id: tests
+        run: |
+          # Replace with your actual test command
+          npm test
+          # or: pytest
+          # or: go test ./...
+        continue-on-error: true
+
+      # Rollback on test failure
+      - name: Rollback on failure
+        if: steps.tests.outcome == 'failure'
+        uses: hubble-ventures/actions-pgroll/rollback@v1
+        with:
+          postgres-url: postgres://postgres:postgres@localhost:5432/appdb
+
+      - name: Rollback notification
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "❌ Tests failed - migration rolled back!"
+          echo "Please fix the issues and try again."
+
+      # Complete on test success
+      - name: Complete migration
+        if: steps.tests.outcome == 'success'
+        uses: hubble-ventures/actions-pgroll/complete@v1
+        with:
+          postgres-url: postgres://postgres:postgres@localhost:5432/appdb
+
+      - name: Success notification
+        if: steps.tests.outcome == 'success'
+        run: echo "✅ Migration completed successfully!"
+
+      # Fail the workflow if tests failed
+      - name: Check final status
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
